@@ -53,6 +53,11 @@ var retryErrorCodes = []int{
 	509, // Bandwidth Limit Exceeded
 }
 
+var retryErrorNumbers = []int{
+	31034, // The frequency of operation is too soon, please try again later
+	9002,  // The frequency of complaint is too fast, please try again later
+}
+
 func (f *Fs) apiExec(ctx context.Context, opts *rest.Opts, res any) error {
 	if opts == nil {
 		return fmt.Errorf("empty request")
@@ -135,6 +140,16 @@ retry:
 				}
 
 				retry++
+				goto retry
+			} else if api.ErrIsNum(err, retryErrorNumbers...) {
+				// Rate limit error - apply exponential backoff
+				retry++
+				if retry > 5 {
+					return err
+				}
+				backoff := time.Duration(1<<uint(retry)) * time.Second // 2s, 4s, 8s, 16s, 32s
+				debug(f.opt, 1, "Rate limit hit (error %d), backing off for %v", err.(api.ErrorInterface).ErrorNumber(), backoff)
+				time.Sleep(backoff)
 				goto retry
 			} else if prefix, ok := resp.Header["Url-Domain-Prefix"]; ok && len(prefix) > 0 && api.ErrIsNum(err, -6) { // for some accounts base url can be different, then for others, update it
 				purl, err := url.Parse(f.baseURL)
