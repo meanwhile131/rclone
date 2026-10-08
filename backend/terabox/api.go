@@ -53,6 +53,27 @@ var retryErrorCodes = []int{
 	509, // Bandwidth Limit Exceeded
 }
 
+// retryAPICodes are the Terabox error codes which mean the request was
+// rejected because the account is too busy (too many operations in
+// flight). They are transient, so the request is worth repeating after
+// a pause instead of failing the transfer.
+var retryAPICodes = []int{
+	111,    // You currently have unfinished tasks, please operate after completion
+	10013,  // You currently have unfinished tasks, please operate after completion
+	300001, // The frequency of exchanging the code for the access_token is too high.
+	31034,  // The frequency of operation is too soon, please try again later
+}
+
+// maxAPIRetryCount is how many times an operation is repeated when
+// Terabox says it is too busy
+const maxAPIRetryCount = 8
+
+// isBusyAPIError returns true if err is one of the transient "too busy"
+// errors returned by Terabox
+func isBusyAPIError(err error) bool {
+	return api.ErrIsNum(err, retryAPICodes...)
+}
+
 func (f *Fs) apiExec(ctx context.Context, opts *rest.Opts, res any) error {
 	if opts == nil {
 		return fmt.Errorf("empty request")
@@ -360,8 +381,28 @@ func (f *Fs) apiOperation(ctx context.Context, operation string, items []api.Ope
 	}
 
 	body := fmt.Sprintf("filelist=%s", strings.ReplaceAll(url.QueryEscape(string(mItems)), "+", "%20"))
-	opt.Body = bytes.NewBufferString(body)
 
+	// Terabox is quite strict about the rate of file operations and
+	// rejects the requests which are sent too soon with a "too busy"
+	// error. Such errors are transient, so repeat the operation with a
+	// pause instead of failing the transfer.
+	for attempt := 1; ; attempt++ {
+		opt.Body = bytes.NewBufferString(body) // the body is consumed by the request, so make a fresh one for each attempt
+
+		err := f._apiOperation(ctx, operation, opt)
+		if err == nil || !isBusyAPIError(err) || attempt >= maxAPIRetryCount {
+			return err
+		}
+
+		wait := time.Duration(attempt) * time.Second
+		debug(f.opt, 1, "%s: %v - retrying in %v (attempt %d/%d)", operation, err, wait, attempt+1, maxAPIRetryCount)
+		time.Sleep(wait)
+	}
+}
+
+// _apiOperation performs a single copy/move/rename/delete operation and
+// waits for its result
+func (f *Fs) _apiOperation(ctx context.Context, operation string, opt *rest.Opts) error {
 	var res api.ResponseOperational
 	if err := f.apiExec(ctx, opt, &res); err != nil {
 		return err
